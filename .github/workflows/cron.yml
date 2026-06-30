@@ -1,0 +1,22 @@
+name: QWS reminders
+
+on:
+  schedule:
+    - cron: "0 0 * * *"   # 07:00 giờ VN hằng ngày (00:00 UTC)
+  workflow_dispatch: {}    # cho phép bấm chạy thử thủ công
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Gửi nhắc Telegram
+        run: python bot.py
+        env:
+          QWS_EMAIL: ${{ secrets.QWS_EMAIL }}
+          QWS_PASSWORD: ${{ secrets.QWS_PASSWORD }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
