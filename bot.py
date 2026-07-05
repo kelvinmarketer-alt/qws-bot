@@ -5,9 +5,11 @@ Quang Workspace — bot nhắc Telegram.
 dòng của chính mình) rồi gửi Telegram:
   - Lịch chuyển quỹ ĐẾN HẠN (chế độ nhắc + xác nhận: bot chỉ nhắc, KHÔNG tự chuyển)
   - Việc hôm nay / việc quá hạn
+  - Sự kiện LỊCH ÂM (giỗ/sinh nhật/kỷ niệm/nhắc việc) thêm trong app — nhắc trước N ngày
 Chạy hằng ngày qua GitHub Actions (07:00 giờ VN). Không gửi gì nếu không có gì đến hạn.
 """
 import os, sys, json, calendar, datetime, urllib.request
+from lunar import solar2lunar, lunar2solar
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL") or "https://dbfffwtnxhytcoczhxhf.supabase.co"
 ANON = os.environ.get("SUPABASE_ANON_KEY") or "sb_publishable_TaKPhmv9_ig8Z7rl-PZupw_AnzYwFQo"
@@ -64,6 +66,78 @@ def pending_occs(sc, today_iso):
     return out
 
 
+# ===== SỰ KIỆN LỊCH ÂM (family) — khớp logic upcomingEvents trong app =====
+CAT_ICON = {"giỗ": "🕯️", "sinh nhật": "🎂", "kỷ niệm": "💗", "lễ": "🎉", "khác": "🔔"}
+
+
+def norm_ev(f):
+    remind = f.get("remindBefore")
+    if not isinstance(remind, list) or not remind:
+        remind = [7, 3, 1, 0]
+    base = f.get("baseYear")
+    return {
+        "title": (f.get("title") or "").strip(),
+        "cal": "am" if f.get("calendar") == "am" else "duong",
+        "day": int(f.get("day") or 0),
+        "month": int(f.get("month") or 0),
+        "repeat": f.get("repeat") or "year",
+        "remind": [int(x) for x in remind if isinstance(x, (int, float))],
+        "baseYear": int(base) if base else None,
+        "done": f.get("done") is True,
+        "category": f.get("category") or "giỗ",
+    }
+
+
+def _occ_solar(ev, year):
+    if ev["cal"] == "am":
+        d, m, y = lunar2solar(ev["day"], ev["month"], year)
+        if not d:
+            return None
+        return datetime.date(y, m, d)
+    try:
+        return datetime.date(year, ev["month"], ev["day"])
+    except ValueError:
+        return None
+
+
+def next_occ(ev, today):
+    rp = ev["repeat"]
+    if rp == "once":
+        return _occ_solar(ev, ev["baseYear"] or today.year)
+    if rp == "month":  # lặp mỗi tháng (âm hoặc dương)
+        for i in range(0, 62):
+            d = today + datetime.timedelta(days=i)
+            if ev["cal"] == "am":
+                if solar2lunar(d.day, d.month, d.year)[0] == ev["day"]:
+                    return d
+            elif d.day == ev["day"]:
+                return d
+        return None
+    for y in (today.year, today.year + 1):  # hằng năm
+        o = _occ_solar(ev, y)
+        if o and o >= today:
+            return o
+    return None
+
+
+def collect_events(family, today):
+    out = []
+    for f in family or []:
+        ev = norm_ev(f)
+        if not ev["title"] or ev["day"] <= 0:
+            continue
+        o = next_occ(ev, today)
+        if not o:
+            continue
+        du = (o - today).days
+        if ev["repeat"] == "once" and (ev["done"] or o < today):
+            continue
+        if du >= 0 and du in ev["remind"]:  # đúng ngày cần nhắc (giống willRemind trong app)
+            out.append((ev, o, du))
+    out.sort(key=lambda x: x[2])
+    return out
+
+
 def main():
     # ngày theo giờ VN (CI chạy UTC)
     today = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=7)).date()
@@ -82,6 +156,7 @@ def main():
     funds = data.get("funds", []) or []
     schedules = data.get("fundSchedules", []) or []
     tasks = data.get("tasks", []) or []
+    family = data.get("family", []) or []
     name_of = {f.get("id"): f.get("name", "quỹ") for f in funds}
 
     # lịch chuyển đến hạn
@@ -94,6 +169,9 @@ def main():
     # việc hôm nay / quá hạn
     today_tasks = [t for t in tasks if t.get("date") == today_iso and t.get("status") != "done"]
     overdue = [t for t in tasks if t.get("date") and t.get("date") < today_iso and t.get("status") != "done"]
+
+    # sự kiện lịch âm cần nhắc hôm nay
+    events = collect_events(family, today)
 
     lines = []
     if due:
@@ -114,6 +192,18 @@ def main():
         lines.append("⚠️ <b>Việc quá hạn</b>")
         for t in overdue[:10]:
             lines.append(f"• {t.get('title', '')} ({t.get('date')})")
+    if events:
+        lines.append("")
+        lines.append("📅 <b>Lịch âm · Sự kiện</b>")
+        for ev, o, du in events[:12]:
+            ld = solar2lunar(o.day, o.month, o.year)
+            when = "hôm nay" if du == 0 else f"còn {du} ngày"
+            icon = CAT_ICON.get(ev["category"], "🔔")
+            yrs = ""
+            if ev["baseYear"] and ev["repeat"] != "once":
+                nyr = o.year - ev["baseYear"]
+                yrs = f" · {nyr} tuổi" if ev["category"] == "sinh nhật" else f" · {nyr} năm"
+            lines.append(f"{icon} {ev['title']} — {o.day}/{o.month} (ÂL {ld[0]}/{ld[1]}) · {when}{yrs}")
 
     if not lines:
         print("Không có gì đến hạn hôm nay — không gửi.")
