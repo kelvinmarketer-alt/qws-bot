@@ -34,6 +34,24 @@ def vnd(n):
     return f"{int(n or 0):,}".replace(",", ".") + "đ"
 
 
+def _num(x):
+    try:
+        return float(x or 0)
+    except Exception:
+        return 0
+
+
+def send_push(token, uid, title, body):
+    """Gửi Web Push nền qua edge function qws-send-push tới các thiết bị của user."""
+    try:
+        r = http(f"{SUPABASE_URL}/functions/v1/qws-send-push",
+                 {"apikey": ANON, "Authorization": f"Bearer {token}"},
+                 {"user_id": uid, "title": title, "body": body, "url": APP_URL, "tag": "daily"})
+        print("Push:", r)
+    except Exception as e:
+        print("Push lỗi:", repr(e), file=sys.stderr)
+
+
 def add_every(d, every):
     if every == "week":
         return d + datetime.timedelta(days=7)
@@ -157,6 +175,8 @@ def main():
     schedules = data.get("fundSchedules", []) or []
     tasks = data.get("tasks", []) or []
     family = data.get("family", []) or []
+    projects = data.get("projects", []) or []
+    fund_tx = data.get("fundTx", []) or []
     name_of = {f.get("id"): f.get("name", "quỹ") for f in funds}
 
     # lịch chuyển đến hạn
@@ -172,6 +192,31 @@ def main():
 
     # sự kiện lịch âm cần nhắc hôm nay
     events = collect_events(family, today)
+
+    # thu / chi hôm nay (cho push cập nhật)
+    thu_today = 0.0
+    for p in projects:
+        for i in (p.get("installments") or []):
+            if str(i.get("date"))[:10] == today_iso:
+                thu_today += _num(i.get("amount")) - _num(i.get("refund")) - _num(i.get("carry"))
+    chi_today = sum(_num(t.get("amount")) for t in fund_tx
+                    if t.get("type") == "out" and not t.get("xferId") and str(t.get("date"))[:10] == today_iso)
+
+    # ===== WEB PUSH NỀN — gửi MỖI NGÀY (cập nhật sự kiện + thu/chi) =====
+    pparts = []
+    ev_today = [ev for ev, o, du in events if du == 0]
+    if ev_today:
+        pparts.append("📅 " + ", ".join(e["title"] for e in ev_today[:3]))
+    if today_tasks:
+        pparts.append(f"✅ {len(today_tasks)} việc hôm nay")
+    if overdue:
+        pparts.append(f"⚠️ {len(overdue)} việc quá hạn")
+    if due:
+        pparts.append(f"💸 {len(due)} chuyển quỹ đến hạn")
+    if thu_today or chi_today:
+        pparts.append(f"💰 thu {vnd(thu_today)} · chi {vnd(chi_today)}")
+    pbody = " · ".join(pparts) if pparts else "Chưa có nhắc nào — nhớ ghi thu/chi & sự kiện hôm nay 📝"
+    send_push(token, uid, f"Quang Workspace · {today.strftime('%d/%m')}", pbody)
 
     lines = []
     if due:
