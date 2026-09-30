@@ -156,6 +156,34 @@ def collect_events(family, today):
     return out
 
 
+REN_DAYS = {14, 7, 3, 1, 0}  # nhắc trước 14/7/3/1 ngày + ngày đến hạn
+
+
+def next_renewal(start_iso, recurring, today):
+    """Ngày gia hạn KẾ TIẾP (>= hôm nay) của chi phí định kỳ."""
+    try:
+        d0 = datetime.date.fromisoformat(str(start_iso)[:10])
+    except Exception:
+        return None
+    if recurring == "monthly":
+        y, m = today.year, today.month
+        for _ in range(3):
+            cand = datetime.date(y, m, min(d0.day, calendar.monthrange(y, m)[1]))
+            if cand >= today:
+                return cand
+            m += 1
+            if m > 12:
+                m = 1; y += 1
+        return None
+    if recurring == "yearly":
+        for yy in (today.year, today.year + 1):
+            cand = datetime.date(yy, d0.month, min(d0.day, calendar.monthrange(yy, d0.month)[1]))
+            if cand >= today:
+                return cand
+        return None
+    return None
+
+
 def main():
     # ngày theo giờ VN (CI chạy UTC)
     today = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=7)).date()
@@ -177,7 +205,29 @@ def main():
     family = data.get("family", []) or []
     projects = data.get("projects", []) or []
     fund_tx = data.get("fundTx", []) or []
+    expenses = data.get("expenses", []) or []
     name_of = {f.get("id"): f.get("name", "quỹ") for f in funds}
+
+    # Gia hạn chi phí định kỳ (hằng tháng/năm) — nhắc trước 14/7/3/1 ngày + ngày đến hạn
+    exp_due = []
+    for e in expenses:
+        rec = e.get("recurring")
+        if rec not in ("monthly", "yearly") or e.get("active") is False:
+            continue
+        nr = next_renewal(e.get("date"), rec, today)
+        if not nr:
+            continue
+        end = e.get("endDate")
+        if end:
+            try:
+                if nr > datetime.date.fromisoformat(str(end)[:10]):
+                    continue
+            except Exception:
+                pass
+        du = (nr - today).days
+        if du in REN_DAYS:
+            exp_due.append((e, nr, du))
+    exp_due.sort(key=lambda x: x[2])
 
     # lịch chuyển đến hạn
     due = []
@@ -213,6 +263,8 @@ def main():
         pparts.append(f"⚠️ {len(overdue)} việc quá hạn")
     if due:
         pparts.append(f"💸 {len(due)} chuyển quỹ đến hạn")
+    if exp_due:
+        pparts.append("🔁 " + ", ".join(f"{e.get('name','')} ({'hôm nay' if du == 0 else str(du) + 'n'})" for e, nr, du in exp_due[:3]))
     if thu_today or chi_today:
         pparts.append(f"💰 thu {vnd(thu_today)} · chi {vnd(chi_today)}")
     pbody = " · ".join(pparts) if pparts else "Chưa có nhắc nào — nhớ ghi thu/chi & sự kiện hôm nay 📝"
@@ -237,6 +289,12 @@ def main():
         lines.append("⚠️ <b>Việc quá hạn</b>")
         for t in overdue[:10]:
             lines.append(f"• {t.get('title', '')} ({t.get('date')})")
+    if exp_due:
+        lines.append("")
+        lines.append("🔁 <b>Gia hạn sắp tới</b>")
+        for e, nr, du in exp_due[:12]:
+            when = "hôm nay" if du == 0 else f"còn {du} ngày"
+            lines.append(f"• {e.get('name', '')} — {vnd(e.get('amount'))} · {nr.strftime('%d/%m/%Y')} ({when})")
     if events:
         lines.append("")
         lines.append("📅 <b>Lịch âm · Sự kiện</b>")
