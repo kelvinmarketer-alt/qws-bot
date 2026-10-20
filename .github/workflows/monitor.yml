@@ -1,0 +1,32 @@
+name: QWS live-bot monitor
+# Canh bot giao dịch trên máy bàn (bảng qws_live_bot): mất liên lạc / hoạt động lại, cảnh báo giá,
+# tổng kết ngày ~22:00 giờ VN. Mỗi 10 phút. Xem monitor.py.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # mỗi 10 phút (GitHub có thể trễ vài phút)
+  workflow_dispatch: {}       # bấm chạy thử thủ công
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qws-monitor          # không cho 2 lượt chạy chồng nhau (tránh báo trùng / ghi đè command)
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Canh bot giao dịch + cảnh báo giá
+        run: python monitor.py
+        env:
+          QWS_EMAIL: ${{ secrets.QWS_EMAIL }}
+          QWS_PASSWORD: ${{ secrets.QWS_PASSWORD }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
