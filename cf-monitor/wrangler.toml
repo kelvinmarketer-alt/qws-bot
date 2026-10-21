@@ -1,0 +1,11 @@
+# Worker canh bot giao dịch (xem worker.js). Đưa lên Cloudflare: cd cf-monitor && npx wrangler deploy
+name = "qws-monitor"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[observability]
+enabled = true

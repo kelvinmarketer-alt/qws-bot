@@ -17,6 +17,7 @@ ANON = os.environ.get("SUPABASE_ANON_KEY") or "sb_publishable_TaKPhmv9_ig8Z7rl-P
 TABLE = "qws_live_bot"
 
 OFFLINE_MS = 8 * 60 * 1000          # status.at cũ hơn 8 phút = mất liên lạc
+CF_ALIVE_MS = 45 * 60 * 1000        # Worker Cloudflare ghi nhịp tim (command.cfMonitorAt) ≥ 30 phút/lần; cũ hơn 45 phút = Worker chết → GitHub làm thay
 DAILY_UTC = (15, 0)                  # 15:00 UTC = 22:00 giờ VN
 DAILY_WINDOW_MIN = 120               # gửi ở lượt chạy đầu tiên trong 15:00–16:59 UTC (cron GitHub có thể trễ hàng chục phút)
 VN = datetime.timezone(datetime.timedelta(hours=7))
@@ -279,7 +280,7 @@ def decide_daily(history, status, cmd, now_utc):
     trades = []
     for t in (history or {}).get("trades") or []:
         ex = to_ms(t.get("exitAt")) if isinstance(t, dict) else None
-        if ex and vn_dt(ex).date().isoformat() == today and (t.get("mode") or mode) == mode:
+        if ex and vn_dt(ex).date().isoformat() == today and (t.get("mode") or mode) == mode and t.get("setup") != "TEST":  # bỏ lệnh thử
             trades.append(t)
     label = "Tiền thật" if mode == "live" else "Testnet"
     eq = num((status.get("lastScan") or {}).get("eq"))
@@ -381,6 +382,11 @@ def run(token, uid, now_ms, now_utc):
     cmd = rows.get("command")
     if cmd is None:
         log("Chưa có dòng 'command' — bỏ qua.")
+        return
+    # Worker Cloudflare (cf-monitor/, cron 5 phút, đúng giờ) còn sống → nhường, tránh báo trùng. GitHub chỉ còn là dự phòng.
+    cf = to_ms(cmd.get("cfMonitorAt"))
+    if cf and now_ms - cf < CF_ALIVE_MS:
+        log(f"Worker Cloudflare đang canh (nhịp tim cách {int((now_ms - cf) / 60000)} phút) — nhường, không làm gì.")
         return
     status, history = rows.get("status"), rows.get("history")
     sets, fired = {}, {}
@@ -589,6 +595,9 @@ def selftest():
         db["status"]["at"] = now + 19 * MIN + 30_000                   # máy bàn có lại
         run("tok", "uid", now + 20 * MIN, now_utc)
         assert pushed == ["✅ Bot hoạt động lại"] and db["command"]["onlineAlertAt"] == now + 20 * MIN
+        db["command"]["cfMonitorAt"] = now + 20 * MIN - 10 * MIN; db["status"]["at"] = now; pushed.clear()  # Worker còn sống → nhường
+        run("tok", "uid", now + 20 * MIN, now_utc)
+        assert pushed == [], pushed
         del db["command"]; pushed.clear()
         run("tok", "uid", now, now_utc)                                # thiếu dòng command → im lặng
         assert pushed == []

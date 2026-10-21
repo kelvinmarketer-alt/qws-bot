@@ -41,3 +41,12 @@ trường này (giữ nguyên `keys`/`config`/`stop`/cảnh báo mới). Chưa c
 Repo public → log chỉ in số đếm, không in giá/vốn/lãi lỗ/ghi chú.
 
 Kiểm tra logic không cần mạng: `python3 monitor.py --selftest`.
+
+## Canh bot đúng giờ trên Cloudflare (`cf-monitor/`, 5 phút/lần)
+Cron của GitHub Actions hay trễ hàng giờ. Vì vậy **Worker Cloudflare `qws-monitor`** chạy chính, cùng logic với `monitor.py` nhưng viết lại bằng JS.
+- Worker ghi nhịp tim vào `command.cfMonitorAt` (≥ 30 phút/lần).
+- `monitor.py` trên GitHub thấy nhịp tim mới hơn 45 phút thì **nhường**, để không báo trùng. Worker chết thì GitHub tự làm thay.
+- Cài 1 lần:
+  1. `cd cf-monitor && npx wrangler deploy`
+  2. **Tự gõ** 2 secret: `npx wrangler secret put QWS_EMAIL` và `npx wrangler secret put QWS_PASSWORD`
+- Kiểm tra logic không cần mạng: `node cf-monitor/test.mjs`
