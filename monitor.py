@@ -164,8 +164,8 @@ def alert_key(a):
 def pending_alerts(alerts):
     out = []
     for a in alerts if isinstance(alerts, list) else []:
-        if not isinstance(a, dict) or a.get("firedAt"):
-            continue
+        if not isinstance(a, dict) or a.get("firedAt") or a.get("market") == "mt5":
+            continue  # cảnh báo Forex (MT5): chỉ Worker Cloudflare xử lý (đọc giá từ cầu nối MT5)
         op, target, sym = OPS.get(str(a.get("op", "")).strip()), num(a.get("price")), norm_symbol(a.get("symbol"))
         if not op or target is None or target <= 0 or not sym:
             continue

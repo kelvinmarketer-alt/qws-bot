@@ -12,7 +12,8 @@ export const OFFLINE_MS = 8 * MIN;
 export const HEARTBEAT_MS = 30 * MIN;
 const DAILY_UTC_H = 15, DAILY_WINDOW_MIN = 120; // 15:00 UTC = 22:00 giờ VN; gửi ở lượt đầu tiên trong 15:00–16:59 UTC
 const VN = 7 * 3600000;
-const URL_LIVE = "/coin?tab=live", URL_MARKET = "/coin?tab=market";
+const URL_LIVE = "/coin?tab=live", URL_MARKET = "/coin?tab=market", URL_FX = "/coin?tab=fxmarket";
+const MT5_TABLE = "qws_mt5_bot", MT5_FRESH_MS = 10 * MIN; // giá Forex chỉ tin khi cầu nối MT5 gửi trong 10 phút gần nhất
 const SPOT_HOSTS = ["https://api.binance.com", "https://data-api.binance.vision"];
 const FUT_HOST = "https://fapi.binance.com";
 
@@ -69,9 +70,10 @@ export function pendingAlerts(alerts) {
   const out = [];
   for (const a of Array.isArray(alerts) ? alerts : []) {
     if (!a || typeof a !== "object" || a.firedAt) continue;
-    const op = OPS[String(a.op ?? "").trim()], target = num(a.price), symbol = normSymbol(a.symbol);
+    const mt5 = a.market === "mt5"; // 09/11: cảnh báo Forex/CFD từ tab Thị trường Forex — mã giữ nguyên (XAUUSD), giá lấy từ cầu nối MT5
+    const op = OPS[String(a.op ?? "").trim()], target = num(a.price), symbol = mt5 ? String(a.symbol || "").toUpperCase().replace(/[^A-Z0-9]/g, "") : normSymbol(a.symbol);
     if (!op || target == null || target <= 0 || !symbol) continue;
-    out.push({ key: alertKey(a), a, op, target, symbol, market: a.market === "spot" ? "spot" : "futures" });
+    out.push({ key: alertKey(a), a, op, target, symbol, market: mt5 ? "mt5" : a.market === "spot" ? "spot" : "futures" });
   }
   return out;
 }
@@ -79,12 +81,27 @@ export function decidePriceAlerts(pend, prices, now) {
   const hits = [];
   for (const p of pend) {
     const got = prices[`${p.market}|${p.symbol}`]; if (!got) continue;
-    const [price, approx] = got;
-    if (!(p.op === ">=" ? price >= p.target : price <= p.target)) continue;
-    const note = String(p.a.note || "").trim(), cur = `Giá ${p.market === "spot" ? "Spot" : "Futures"} hiện ${fmtPrice(price)}${approx ? " (tham chiếu giá spot)" : ""}`;
-    hits.push({ key: p.key, tag: `price-${p.key}`.slice(0, 64), url: URL_MARKET, title: `🔔 ${p.symbol} ${p.op === ">=" ? "≥" : "≤"} ${fmtPrice(p.target)}`, body: note ? `${note} · ${cur}` : cur, set: { firedAt: now, firedPrice: price } });
+    const [price, approx, ex] = got;
+    // Forex: nến M5 đang chạy cho biết giá có CHẠM mức trong ≤ 5 phút qua dù giá hiện đã quay lại — chỉ tính nếu cảnh báo được tạo TRƯỚC khi nến này mở
+    const useBar = p.market === "mt5" && ex && toMs(p.a.createdAt) && toMs(p.a.createdAt) <= ex.barAt;
+    const seen = p.op === ">=" ? Math.max(price, useBar ? ex.hi : -Infinity) : Math.min(price, useBar ? ex.lo : Infinity);
+    if (!(p.op === ">=" ? seen >= p.target : seen <= p.target)) continue;
+    const note = String(p.a.note || "").trim(), cur = p.market === "mt5" ? `Giá MT5 hiện ${fmtPrice(price)}${seen !== price ? ` (đã chạm ${fmtPrice(seen)} trong 5 phút qua)` : ""}` : `Giá ${p.market === "spot" ? "Spot" : "Futures"} hiện ${fmtPrice(price)}${approx ? " (tham chiếu giá spot)" : ""}`;
+    hits.push({ key: p.key, tag: `price-${p.key}`.slice(0, 64), url: p.market === "mt5" ? URL_FX : URL_MARKET, title: `🔔 ${p.symbol} ${p.op === ">=" ? "≥" : "≤"} ${fmtPrice(p.target)}`, body: note ? `${note} · ${cur}` : cur, set: { firedAt: now, firedPrice: seen } });
   }
   return hits;
+}
+// Giá Forex từ dòng mkq của cầu nối MT5 (bid + nến M5 đang chạy). Cầu nối ngừng gửi / chợ đóng cửa → không có giá → không báo nhầm.
+export function mt5Prices(pend, mkq, now) {
+  const out = {}, ts = toMs(mkq?.ts);
+  if (!mkq || !ts || now - ts > MT5_FRESH_MS || mkq.live === false) return out;
+  for (const p of pend) {
+    if (p.market !== "mt5") continue;
+    const q = mkq.q?.[p.symbol], bid = num(q?.bid); if (bid == null) continue;
+    const f = q.f?.["5m"], ex = Array.isArray(f) && f.length >= 5 ? { barAt: Number(f[0]) * 1000, hi: num(f[2]) ?? bid, lo: num(f[3]) ?? bid } : null;
+    out[`mt5|${p.symbol}`] = [bid, false, ex];
+  }
+  return out;
 }
 const getJson = async (url) => { const r = await fetch(url, { signal: AbortSignal.timeout(15000) }); if (!r.ok) { const e = new Error(`HTTP ${r.status}`); e.status = r.status; throw e; } return r.json(); };
 async function spotPrices(symbols) {
@@ -154,6 +171,7 @@ export function makeApi(env, http = fetch) {
   };
   return {
     login: async () => { if (!env.QWS_EMAIL || !env.QWS_PASSWORD) throw new Error("thiếu secret QWS_EMAIL / QWS_PASSWORD"); const a = await call("/auth/v1/token?grant_type=password", { method: "POST", body: { email: env.QWS_EMAIL, password: env.QWS_PASSWORD } }); return [a.access_token, a.user.id]; },
+    readMkq: async (token) => { const rows = await call(`/rest/v1/${MT5_TABLE}?id=eq.mkq&select=data`, { token }); return rows?.length ? rows[0].data || null : null; },
     logout: (token) => call("/auth/v1/logout?scope=local", { token, method: "POST", body: {} }).catch(() => {}), // chỉ phiên này, app vẫn đăng nhập
     readRows: async (token) => Object.fromEntries(((await call(`/rest/v1/${TABLE}?select=id,data`, { token })) || []).map((r) => [r.id, r.data || {}])),
     readCommand: async (token) => { const rows = await call(`/rest/v1/${TABLE}?id=eq.command&select=data`, { token }); return rows?.length ? rows[0].data || {} : null; },
@@ -170,7 +188,9 @@ export async function run(api, token, uid, now, deps = { fetchPrices }) {
   try { if (status) { const d = decideOffline(status, cmd, now); console.log(`Trạng thái: tín hiệu cách ${Math.round((now - (toMs(status.at) || now)) / 1000)}s → ${d ? d.kind : "không cần báo"}`); if (d && (await api.push(token, uid, d))) Object.assign(sets, d.set); } } catch (e) { console.log(`Mất liên lạc: lỗi ${e.message}`); }
   try {
     const pend = pendingAlerts(cmd.priceAlerts);
-    if (pend.length) { const hits = decidePriceAlerts(pend, await deps.fetchPrices(pend), now); console.log(`Cảnh báo giá: ${pend.length} đang chờ, chạm ${hits.length}`); for (const h of hits) if (await api.push(token, uid, h)) fired[h.key] = h.set; }
+    if (pend.length) {
+      const mk = pend.some((p) => p.market === "mt5") && api.readMkq ? await api.readMkq(token).catch(() => null) : null;
+      const hits = decidePriceAlerts(pend, { ...(await deps.fetchPrices(pend)), ...mt5Prices(pend, mk, now) }, now); console.log(`Cảnh báo giá: ${pend.length} đang chờ, chạm ${hits.length}`); for (const h of hits) if (await api.push(token, uid, h)) fired[h.key] = h.set; }
   } catch (e) { console.log(`Cảnh báo giá: lỗi ${e.message}`); }
   try { if (history && inDailyWindow(now)) { const d = decideDaily(history, status, cmd, now); if (d && (await api.push(token, uid, d))) Object.assign(sets, d.set); } } catch (e) { console.log(`Tổng kết ngày: lỗi ${e.message}`); }
   const beat = !(toMs(cmd.cfMonitorAt) > now - HEARTBEAT_MS);

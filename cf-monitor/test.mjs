@@ -1,6 +1,6 @@
 // Kiểm tra logic Worker bằng dữ liệu giả, không gọi mạng: node cf-monitor/test.mjs
 import assert from "node:assert/strict";
-import { fmtPrice, signed, viFixed, normSymbol, toMs, decideOffline, pendingAlerts, decidePriceAlerts, inDailyWindow, decideDaily, applyPatch, run } from "./worker.js";
+import { fmtPrice, signed, viFixed, normSymbol, toMs, decideOffline, pendingAlerts, decidePriceAlerts, inDailyWindow, decideDaily, applyPatch, mt5Prices, run } from "./worker.js";
 
 const MIN = 60000, now = Date.UTC(2026, 9, 20, 3, 0); // 10:00 giờ VN 20/10
 assert.equal(fmtPrice(85000), "85.000"); assert.equal(fmtPrice(85000.5), "85.000,5"); assert.equal(fmtPrice(0.00001234), "0,00001234"); assert.equal(fmtPrice(1.5), "1,5");
@@ -64,4 +64,22 @@ await run(api, "tok", "uid", now + 5 * MIN, deps); // không báo lặp, nhịp 
 assert.deepEqual(pushed, []); assert.equal(writes.length, 0);
 await run(api, "tok", "uid", now + 31 * MIN, deps); // quá 30 phút → ghi nhịp tim
 assert.equal(writes.length, 1); assert.equal(db.command.cfMonitorAt, now + 31 * MIN);
+// 6) cảnh báo Forex (MT5): mã giữ nguyên, giá từ mkq, nến M5 bắt cú chạm, không báo khi giá cũ / chợ đóng / alert tạo sau nến
+{
+  const T = 1_800_000_000_000, bar = T - 2 * MIN;
+  const al = [
+    { id: "f1", symbol: "xauusd", market: "mt5", op: ">=", price: 4125, createdAt: bar - 1000 },   // nến M5 chạm 4126 sau khi tạo → báo dù giá hiện 4122
+    { id: "f2", symbol: "EURUSD", market: "mt5", op: "<=", price: 1.0800, createdAt: bar + 1000 }, // tạo SAU khi nến mở → chỉ xét giá hiện tại (1.0850) → chưa báo
+    { id: "f3", symbol: "BTCUSD", market: "mt5", op: ">=", price: 1, createdAt: bar },            // mã không có trong mkq → bỏ qua
+    { id: "c1", symbol: "BTC", market: "futures", op: ">=", price: 1 },
+  ];
+  const pf = pendingAlerts(al); assert.deepEqual(pf.map((p) => [p.symbol, p.market]), [["XAUUSD", "mt5"], ["EURUSD", "mt5"], ["BTCUSD", "mt5"], ["BTCUSDT", "futures"]]);
+  const mk = { ts: T - 30000, live: true, q: { XAUUSD: { bid: 4122, f: { "5m": [bar / 1000, 4120, 4126, 4119, 4122, 10] } }, EURUSD: { bid: 1.085, f: { "5m": [bar / 1000, 1.0855, 1.0860, 1.0845, 1.085, 10] } } } };
+  const pr = mt5Prices(pf, mk, T); assert.deepEqual(Object.keys(pr).sort(), ["mt5|EURUSD", "mt5|XAUUSD"]);
+  const h = decidePriceAlerts(pf, pr, T); assert.deepEqual(h.map((x) => x.key), ["f1"]);
+  assert.match(h[0].title, /XAUUSD ≥ 4\.125/); assert.equal(h[0].url, "/coin?tab=fxmarket"); assert.match(h[0].body, /Giá MT5 hiện 4\.122.*đã chạm 4\.126/); assert.equal(h[0].set.firedPrice, 4126);
+  assert.deepEqual(mt5Prices(pf, { ...mk, ts: T - 11 * MIN }, T), {}, "cầu nối ngừng gửi → không có giá");
+  assert.deepEqual(mt5Prices(pf, { ...mk, live: false }, T), {}, "chợ đóng cửa → không báo bằng giá cũ");
+  assert.deepEqual(mt5Prices(pf, null, T), {});
+}
 console.log("test OK");
