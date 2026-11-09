@@ -8,7 +8,7 @@ dòng của chính mình) rồi gửi Telegram:
   - Sự kiện LỊCH ÂM (giỗ/sinh nhật/kỷ niệm/nhắc việc) thêm trong app — nhắc trước N ngày
 Chạy hằng ngày qua GitHub Actions (07:00 giờ VN). Không gửi gì nếu không có gì đến hạn.
 """
-import os, sys, json, calendar, datetime, urllib.request
+import os, sys, json, calendar, datetime, html, urllib.request
 from lunar import solar2lunar, lunar2solar
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL") or "https://dbfffwtnxhytcoczhxhf.supabase.co"
@@ -50,6 +50,38 @@ def send_push(token, uid, title, body):
         print("Push:", r)
     except Exception as e:
         print("Push lỗi:", repr(e), file=sys.stderr)
+
+
+def fetch_idea(token, seed):
+    """Ý hay hôm nay từ Kho tài liệu (hàm qws-lib, mode idea). Cùng seed = ngày nên khớp với thẻ "Ý hay hôm nay" trong app.
+    Mọi lỗi (chưa cài hàm, kho trống, hết hạn mức…) → None: KHÔNG làm hỏng thông báo nhắc việc hằng ngày."""
+    try:
+        r = http(f"{SUPABASE_URL}/functions/v1/qws-lib",
+                 {"apikey": ANON, "Authorization": f"Bearer {token}"},
+                 {"mode": "idea", "seed": seed})
+        idea = str((r or {}).get("idea") or "").strip()
+        if idea:
+            return {"idea": idea, "title": str((r or {}).get("doc_title") or "").strip()}
+    except Exception as e:
+        print("Ý hay lỗi:", repr(e), file=sys.stderr)
+    return None
+
+
+def idea_push_part(idea, limit=120):
+    """Phần ý hay trong thông báo đẩy (ngắn: màn hình khoá chỉ hiện vài dòng)."""
+    t = " ".join(idea["idea"].split())
+    if len(t) > limit:
+        cut = t[:limit]
+        t = (cut[:cut.rfind(" ")] if cut.rfind(" ") > limit * 0.6 else cut).rstrip(",;: ") + "…"
+    return "💡 " + t
+
+
+def idea_telegram_lines(idea):
+    """Khối ý hay cho tin Telegram (parse_mode HTML → PHẢI escape, nếu không tin sẽ bị Telegram từ chối)."""
+    out = ["", "💡 <b>Ý hay hôm nay</b>", html.escape(" ".join(idea["idea"].split()))]
+    if idea.get("title"):
+        out.append(f"<i>— {html.escape(idea['title'])}</i>")
+    return out
 
 
 def add_every(d, every):
@@ -267,6 +299,9 @@ def main():
         pparts.append("🔁 " + ", ".join(f"{e.get('name','')} ({'hôm nay' if du == 0 else str(du) + 'n'})" for e, nr, du in exp_due[:3]))
     if thu_today or chi_today:
         pparts.append(f"💰 thu {vnd(thu_today)} · chi {vnd(chi_today)}")
+    idea = fetch_idea(token, today_iso)  # 💡 ý hay từ Kho tài liệu (có thể None)
+    if idea:
+        pparts.append(idea_push_part(idea))
     pbody = " · ".join(pparts) if pparts else "Chưa có nhắc nào — nhớ ghi thu/chi & sự kiện hôm nay 📝"
     send_push(token, uid, f"Quang Workspace · {today.strftime('%d/%m')}", pbody)
 
@@ -312,6 +347,8 @@ def main():
         print("Không có gì đến hạn hôm nay — không gửi.")
         return
 
+    if idea:  # chỉ thêm khi đã có nhắc khác — không gửi Telegram chỉ vì ý hay (đỡ spam)
+        lines += idea_telegram_lines(idea)
     msg = f"📊 <b>Quang Workspace</b> · {today.strftime('%d/%m/%Y')}\n" + "\n".join(lines)
     msg += f"\n\n🔗 {APP_URL}"
 
