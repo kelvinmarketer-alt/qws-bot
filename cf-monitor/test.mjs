@@ -83,3 +83,23 @@ assert.equal(writes.length, 1); assert.equal(db.command.cfMonitorAt, now + 31 * 
   assert.deepEqual(mt5Prices(pf, null, T), {});
 }
 console.log("test OK");
+
+// 13/11: nhắc việc trước giờ (giờ VN) khi app tắt
+{
+  const { decideTaskReminders, taskStartMs, remindKey } = await import("./worker.js");
+  const n0 = Date.UTC(2026, 10, 13, 1, 52); // 08:52 giờ VN 13/11
+  assert.equal(taskStartMs({ date: "2026-11-13", time: "09:00" }), Date.UTC(2026, 10, 13, 2, 0));
+  const tasks = [
+    { id: "t1", title: "Họp giao ban", date: "2026-11-13", time: "09:00", remind: 10 },
+    { id: "t2", title: "Xong rồi", date: "2026-11-13", time: "09:00", remind: 10, status: "done" },
+    { id: "t3", title: "Chưa tới", date: "2026-11-13", time: "10:00", remind: 30 },
+    { id: "t4", title: "Không nhắc", date: "2026-11-13", time: "09:00" },
+    { id: "t5", title: "Quá giờ", date: "2026-11-13", time: "08:50", remind: 60 },
+  ];
+  const h = decideTaskReminders(tasks, n0, []);
+  assert.deepEqual(h.map((x) => x.tag), ["task-t1"]);
+  assert.equal(h[0].title, "⏰ 09:00 · Họp giao ban"); assert.equal(h[0].body, "Còn 8 phút nữa");
+  assert.equal(decideTaskReminders(tasks, n0, [remindKey(tasks[0])]).length, 0);
+  assert.equal(decideTaskReminders(null, n0, null).length, 0);
+  console.log("nhắc việc OK");
+}

@@ -1,5 +1,5 @@
 // QWS monitor trên Cloudflare Worker (cron 5 phút/lần, chạy đúng giờ — GitHub Actions hay trễ hàng giờ).
-// Cùng logic monitor.py: 1) mất liên lạc / hoạt động lại · 2) cảnh báo giá · 3) tổng kết ngày từ 22:00 giờ VN.
+// Cùng logic monitor.py: 1) mất liên lạc / hoạt động lại · 2) cảnh báo giá · 3) tổng kết ngày từ 22:00 giờ VN · 4) nhắc việc trước giờ (13/11).
 // Ghi 'command': đọc lại bản MỚI NHẤT ngay trước khi ghi, chỉ sửa trường của monitor (không mất keys/config/cảnh báo app vừa thêm).
 // Nhịp tim: ghi command.cfMonitorAt ≥ 30 phút/lần → monitor.py trên GitHub thấy Worker còn sống thì nhường (không báo trùng).
 // Secret (đặt bằng `wrangler secret put`): QWS_EMAIL, QWS_PASSWORD. URL + anon key là khoá công khai.
@@ -154,6 +154,29 @@ export function decideDaily(history, status, cmd, now) {
   return { tag: "live-daily", url: URL_LIVE, title, body: `${label} · ${items.slice(0, 5).join(" · ")}${items.length > 5 ? ` · +${items.length - 5} lệnh khác` : ""}${tail}`, set: { dailySummaryDate: today }, n: trades.length };
 }
 
+// ---------- nhắc việc trước giờ (13/11) ----------
+// Việc trong app (qws_workspaces.data.tasks) có ngày + giờ + "nhắc trước" 10/30/60 phút → gửi thông báo đẩy kể cả khi app đã tắt.
+// Giờ trong app là giờ VN. Cùng khoá với app (id|ngày|giờ|nhắc) + cùng tag "task-<id>" → app đang mở thì thông báo thay nhau, không ra 2 cái.
+export const remindKey = (t) => `${t.id}|${t.date}|${t.time}|${t.remind}`;
+export function taskStartMs(t) {
+  const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(t?.date || "")), m = /^(\d{1,2}):(\d{2})$/.exec(String(t?.time || ""));
+  return d && m ? Date.UTC(+d[1], +d[2] - 1, +d[3], +m[1], +m[2]) - VN : null;
+}
+export function decideTaskReminders(tasks, now, fired = []) {
+  const seen = new Set(Array.isArray(fired) ? fired : []), out = [];
+  for (const t of Array.isArray(tasks) ? tasks : []) {
+    const mins = Number(t?.remind);
+    if (!t || t.status === "done" || !(mins > 0)) continue;
+    const start = taskStartMs(t);
+    if (start == null || now >= start || now < start - mins * MIN) continue;
+    const key = remindKey(t);
+    if (seen.has(key)) continue;
+    const left = Math.max(1, Math.round((start - now) / MIN));
+    out.push({ key, tag: `task-${t.id}`.slice(0, 64), url: "/cong-viec", title: `⏰ ${t.time} · ${String(t.title || "Việc").slice(0, 80)}`, body: `Còn ${left} phút nữa` });
+  }
+  return out;
+}
+
 // ---------- gộp vào bản MỚI NHẤT ----------
 export function applyPatch(latest, sets, fired) {
   const merged = { ...structuredClone(latest), ...sets }; let n = 0;
@@ -171,6 +194,7 @@ export function makeApi(env, http = fetch) {
   };
   return {
     login: async () => { if (!env.QWS_EMAIL || !env.QWS_PASSWORD) throw new Error("thiếu secret QWS_EMAIL / QWS_PASSWORD"); const a = await call("/auth/v1/token?grant_type=password", { method: "POST", body: { email: env.QWS_EMAIL, password: env.QWS_PASSWORD } }); return [a.access_token, a.user.id]; },
+    readTasks: async (token, uid) => { const rows = await call(`/rest/v1/qws_workspaces?user_id=eq.${uid}&select=tasks:data->tasks`, { token }); return rows?.length && Array.isArray(rows[0].tasks) ? rows[0].tasks : []; },
     readMkq: async (token) => { const rows = await call(`/rest/v1/${MT5_TABLE}?id=eq.mkq&select=data`, { token }); return rows?.length ? rows[0].data || null : null; },
     logout: (token) => call("/auth/v1/logout?scope=local", { token, method: "POST", body: {} }).catch(() => {}), // chỉ phiên này, app vẫn đăng nhập
     readRows: async (token) => Object.fromEntries(((await call(`/rest/v1/${TABLE}?select=id,data`, { token })) || []).map((r) => [r.id, r.data || {}])),
@@ -192,6 +216,14 @@ export async function run(api, token, uid, now, deps = { fetchPrices }) {
       const mk = pend.some((p) => p.market === "mt5") && api.readMkq ? await api.readMkq(token).catch(() => null) : null;
       const hits = decidePriceAlerts(pend, { ...(await deps.fetchPrices(pend)), ...mt5Prices(pend, mk, now) }, now); console.log(`Cảnh báo giá: ${pend.length} đang chờ, chạm ${hits.length}`); for (const h of hits) if (await api.push(token, uid, h)) fired[h.key] = h.set; }
   } catch (e) { console.log(`Cảnh báo giá: lỗi ${e.message}`); }
+  try {
+    if (api.readTasks) {
+      const hits = decideTaskReminders(await api.readTasks(token, uid), now, cmd.taskRemindFired);
+      const done = []; for (const h of hits) if (await api.push(token, uid, h)) done.push(h.key);
+      if (hits.length) console.log(`Nhắc việc: ${hits.length} đến giờ, gửi ${done.length}`);
+      if (done.length) sets.taskRemindFired = [...(Array.isArray(cmd.taskRemindFired) ? cmd.taskRemindFired : []), ...done].slice(-100);
+    }
+  } catch (e) { console.log(`Nhắc việc: lỗi ${e.message}`); }
   try { if (history && inDailyWindow(now)) { const d = decideDaily(history, status, cmd, now); if (d && (await api.push(token, uid, d))) Object.assign(sets, d.set); } } catch (e) { console.log(`Tổng kết ngày: lỗi ${e.message}`); }
   const beat = !(toMs(cmd.cfMonitorAt) > now - HEARTBEAT_MS);
   if (!Object.keys(sets).length && !Object.keys(fired).length && !beat) return;
