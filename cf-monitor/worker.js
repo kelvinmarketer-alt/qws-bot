@@ -1,5 +1,6 @@
 // QWS monitor trên Cloudflare Worker (cron 5 phút/lần, chạy đúng giờ — GitHub Actions hay trễ hàng giờ).
 // Cùng logic monitor.py: 1) mất liên lạc / hoạt động lại · 2) cảnh báo giá · 3) tổng kết ngày từ 22:00 giờ VN · 4) nhắc việc trước giờ (13/11).
+// 22/11: 1b) canh EA MT5 (bảng qws_mt5_bot) — chỉ có ở Worker, monitor.py dự phòng chưa có.
 // Ghi 'command': đọc lại bản MỚI NHẤT ngay trước khi ghi, chỉ sửa trường của monitor (không mất keys/config/cảnh báo app vừa thêm).
 // Nhịp tim: ghi command.cfMonitorAt ≥ 30 phút/lần → monitor.py trên GitHub thấy Worker còn sống thì nhường (không báo trùng).
 // Secret (đặt bằng `wrangler secret put`): QWS_EMAIL, QWS_PASSWORD. URL + anon key là khoá công khai.
@@ -56,6 +57,46 @@ export function decideOffline(status, cmd, now) {
       set: { onlineAlertAt: now } };
   }
   return null;
+}
+
+// ---------- 1b) EA MT5 (22/11/2026) ----------
+// Đọc qws_mt5_bot.status (cầu nối mt5_bridge.py ghi ~30 giây/lần, kể cả cuối tuần). Báo khi: cầu nối im > 10 phút · MT5 không chạy ·
+// Algo Trading / quyền EA tắt · EA không ghi trạng thái > 10 phút · MT5 mất kết nối sàn (bỏ qua lúc chợ Forex đóng cuối tuần).
+// Lỗi không phải "im lặng" phải kéo dài ≥ 10 phút mới báo (tránh báo nhầm lúc khởi động lại MT5). Trạng thái chống báo trùng: command.mt5Bad.
+export const MT5_SILENT_MS = 10 * MIN, MT5_GRACE_MS = 10 * MIN;
+const URL_MT5 = "/coin?tab=forex";
+// Chợ Forex đóng: từ 05:00 thứ Bảy tới 05:00 thứ Hai giờ VN
+export function fxClosed(now) { const d = new Date(now + VN), wd = d.getUTCDay(), h = d.getUTCHours(); return (wd === 6 && h >= 5) || wd === 0 || (wd === 1 && h < 5); }
+export function mt5Problem(st, now) {
+  const ts = toMs(st?.ts); if (!ts) return null;
+  if (now - ts > MT5_SILENT_MS) return { code: "silent", since: ts };
+  if (st.online === false) return { code: "mt5off", text: st.reason || "MT5 không chạy trên máy bàn" };
+  if (st.algo === false) return { code: "algo", text: "Algo Trading trong MT5 đang TẮT — EA không vào lệnh được" };
+  if (st.eaTrade === false) return { code: "eatrade", text: "Tài khoản không cho EA giao dịch (quyền EA tắt)" };
+  const age = num(st.eaAgeS);
+  if (age == null || age > MT5_SILENT_MS / 1000) return { code: "ea", text: `EA không ghi trạng thái ${age == null ? "" : `${Math.round(age / 60)} phút `}— EA có thể đã bị gỡ khỏi chart hoặc bị lỗi` };
+  if (st.connected === false && !fxClosed(now)) return { code: "conn", text: "MT5 mất kết nối máy chủ sàn" };
+  return null;
+}
+export function decideMt5(st, cmd, now) {
+  if (!st) return null;
+  const p = mt5Problem(st, now), b = cmd.mt5Bad && typeof cmd.mt5Bad === "object" ? cmd.mt5Bad : null, ea = st.ea?.ea || "EA";
+  if (!p) {
+    if (!b) return null;
+    const ts = toMs(st.ts) || now;
+    return b.alerted
+      ? { kind: "online", tag: "mt5-status", url: URL_MT5, title: `✅ ${ea} MT5 hoạt động lại`, body: `Cầu nối và EA báo bình thường lúc ${hhmm(ts, now)} (giờ VN), sau sự cố từ ${hhmm(b.at, now)}. Kiểm tra lệnh trong app.`, set: { mt5Bad: null } }
+      : { kind: "clear", set: { mt5Bad: null } }; // lỗi thoáng qua, chưa báo → xoá im lặng
+  }
+  const state = b && b.code === p.code ? { ...b } : { code: p.code, at: p.since || now, alerted: null };
+  if (!state.alerted && now - state.at >= (p.code === "silent" ? 0 : MT5_GRACE_MS)) {
+    state.alerted = now;
+    const body = p.code === "silent"
+      ? `Cầu nối MT5 không gửi tín hiệu từ ${hhmm(p.since, now)} (giờ VN) — máy bàn tắt/mất mạng hoặc cầu nối dừng. Lệnh đang mở vẫn có SL/TP trên sàn.`
+      : `${p.text} (từ ${hhmm(state.at, now)} giờ VN). Kiểm tra MT5 trên máy bàn.`;
+    return { kind: "offline", tag: "mt5-status", url: URL_MT5, title: p.code === "silent" ? `⚠️ ${ea} MT5 mất liên lạc` : `⚠️ ${ea} MT5 có vấn đề`, body, set: { mt5Bad: state } };
+  }
+  return JSON.stringify(state) === JSON.stringify(b) ? null : { kind: "pending", set: { mt5Bad: state } };
 }
 
 // ---------- 2) cảnh báo giá ----------
@@ -196,6 +237,7 @@ export function makeApi(env, http = fetch) {
     login: async () => { if (!env.QWS_EMAIL || !env.QWS_PASSWORD) throw new Error("thiếu secret QWS_EMAIL / QWS_PASSWORD"); const a = await call("/auth/v1/token?grant_type=password", { method: "POST", body: { email: env.QWS_EMAIL, password: env.QWS_PASSWORD } }); return [a.access_token, a.user.id]; },
     readTasks: async (token, uid) => { const rows = await call(`/rest/v1/qws_workspaces?user_id=eq.${uid}&select=tasks:data->tasks`, { token }); return rows?.length && Array.isArray(rows[0].tasks) ? rows[0].tasks : []; },
     readMkq: async (token) => { const rows = await call(`/rest/v1/${MT5_TABLE}?id=eq.mkq&select=data`, { token }); return rows?.length ? rows[0].data || null : null; },
+    readMt5Status: async (token) => { const rows = await call(`/rest/v1/${MT5_TABLE}?id=eq.status&select=ts:data->ts,online:data->online,reason:data->reason,algo:data->algo,eaTrade:data->eaTrade,connected:data->connected,eaAgeS:data->eaAgeS,ea:data->ea->ea`, { token }); const r = rows?.[0]; return r ? { ...r, ea: r.ea ? { ea: r.ea } : null } : null; },
     logout: (token) => call("/auth/v1/logout?scope=local", { token, method: "POST", body: {} }).catch(() => {}), // chỉ phiên này, app vẫn đăng nhập
     readRows: async (token) => Object.fromEntries(((await call(`/rest/v1/${TABLE}?select=id,data`, { token })) || []).map((r) => [r.id, r.data || {}])),
     readCommand: async (token) => { const rows = await call(`/rest/v1/${TABLE}?id=eq.command&select=data`, { token }); return rows?.length ? rows[0].data || {} : null; },
@@ -210,6 +252,13 @@ export async function run(api, token, uid, now, deps = { fetchPrices }) {
   const cmd = rows.command; if (!cmd) { console.log("Chưa có dòng 'command' — bỏ qua."); return; }
   const { status, history } = rows, sets = {}, fired = {};
   try { if (status) { const d = decideOffline(status, cmd, now); console.log(`Trạng thái: tín hiệu cách ${Math.round((now - (toMs(status.at) || now)) / 1000)}s → ${d ? d.kind : "không cần báo"}`); if (d && (await api.push(token, uid, d))) Object.assign(sets, d.set); } } catch (e) { console.log(`Mất liên lạc: lỗi ${e.message}`); }
+  try {
+    if (api.readMt5Status) {
+      const m = decideMt5(await api.readMt5Status(token), cmd, now);
+      console.log(`EA MT5: ${m ? m.kind : "bình thường"}`);
+      if (m && (!m.title || (await api.push(token, uid, m)))) Object.assign(sets, m.set);
+    }
+  } catch (e) { console.log(`EA MT5: lỗi ${e.message}`); }
   try {
     const pend = pendingAlerts(cmd.priceAlerts);
     if (pend.length) {

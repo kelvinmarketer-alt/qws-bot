@@ -103,3 +103,53 @@ console.log("test OK");
   assert.equal(decideTaskReminders(null, n0, null).length, 0);
   console.log("nhắc việc OK");
 }
+
+// 22/11: canh EA MT5 (qws_mt5_bot.status)
+{
+  const { decideMt5, mt5Problem, fxClosed } = await import("./worker.js");
+  const T = Date.UTC(2026, 10, 24, 3, 0); // 10:00 giờ VN thứ Ba 24/11
+  const ok = { ts: T - 20000, online: true, connected: true, algo: true, eaTrade: true, eaAgeS: 8, ea: { ea: "Victor V5" } };
+  assert.equal(mt5Problem(ok, T), null); assert.equal(decideMt5(ok, {}, T), null); assert.equal(decideMt5(null, {}, T), null);
+  // cầu nối im 12 phút → báo ngay, 1 lần
+  const s1 = decideMt5({ ...ok, ts: T - 12 * MIN }, {}, T);
+  assert.equal(s1.title, "⚠️ Victor V5 MT5 mất liên lạc"); assert.match(s1.body, /từ 09:48 \(giờ VN\)/); assert.equal(s1.url, "/coin?tab=forex");
+  assert.deepEqual(s1.set.mt5Bad, { code: "silent", at: T - 12 * MIN, alerted: T });
+  assert.equal(decideMt5({ ...ok, ts: T - 17 * MIN }, { mt5Bad: s1.set.mt5Bad }, T + 5 * MIN), null, "không báo lặp");
+  // hồi lại → báo hoạt động lại + xoá trạng thái
+  const r1 = decideMt5({ ...ok, ts: T + 9 * MIN }, { mt5Bad: s1.set.mt5Bad }, T + 10 * MIN);
+  assert.equal(r1.title, "✅ Victor V5 MT5 hoạt động lại"); assert.deepEqual(r1.set, { mt5Bad: null }); assert.match(r1.body, /sau sự cố từ 09:48/);
+  // Algo tắt: lần đầu chỉ ghi nhận, ≥ 10 phút mới báo
+  const a1 = decideMt5({ ...ok, algo: false }, {}, T);
+  assert.equal(a1.kind, "pending"); assert.equal(a1.title, undefined); assert.deepEqual(a1.set.mt5Bad, { code: "algo", at: T, alerted: null });
+  assert.equal(decideMt5({ ...ok, algo: false }, { mt5Bad: a1.set.mt5Bad }, T + 5 * MIN), null);
+  const a2 = decideMt5({ ...ok, ts: T + 10 * MIN - 20000, algo: false }, { mt5Bad: a1.set.mt5Bad }, T + 10 * MIN);
+  assert.equal(a2.title, "⚠️ Victor V5 MT5 có vấn đề"); assert.match(a2.body, /Algo Trading/);
+  // lỗi thoáng qua (chưa báo) hết → xoá im lặng, không gửi thông báo
+  const c1 = decideMt5(ok, { mt5Bad: a1.set.mt5Bad }, T + 5 * MIN); assert.equal(c1.kind, "clear"); assert.equal(c1.title, undefined);
+  // các lỗi khác
+  assert.equal(mt5Problem({ ...ok, online: false, reason: "MT5 không chạy trên máy bàn" }, T).code, "mt5off");
+  assert.equal(mt5Problem({ ...ok, eaAgeS: 900 }, T).code, "ea"); assert.equal(mt5Problem({ ...ok, eaAgeS: null }, T).code, "ea");
+  assert.equal(mt5Problem({ ...ok, eaTrade: false }, T).code, "eatrade");
+  assert.equal(mt5Problem({ ...ok, connected: false }, T).code, "conn");
+  // cuối tuần chợ đóng: mất kết nối sàn không báo, nhưng cầu nối im vẫn báo
+  const sun = Date.UTC(2026, 10, 22, 3, 0); assert.ok(fxClosed(sun)); assert.ok(!fxClosed(T)); assert.ok(fxClosed(Date.UTC(2026, 10, 21, 0, 0))); assert.ok(!fxClosed(Date.UTC(2026, 10, 23, 0, 0)));
+  assert.equal(mt5Problem({ ...ok, ts: sun - 20000, connected: false }, sun), null);
+  assert.equal(mt5Problem({ ...ok, ts: sun - 20 * MIN }, sun).code, "silent");
+  // run(): đọc status MT5, gửi thông báo, ghi mt5Bad vào command
+  const db2 = { status: { at: T - 30000 }, history: { trades: [] }, command: { cfMonitorAt: T - MIN } };
+  const pushed2 = [], writes2 = [];
+  let mst = { ...ok, ts: T - 15 * MIN };
+  const api2 = {
+    readRows: async () => structuredClone(db2), readCommand: async () => structuredClone(db2.command),
+    writeCommand: async (_t, data) => { writes2.push(data); db2.command = data; },
+    push: async (_t, _u, msg) => { pushed2.push(msg.title); return true; }, readMt5Status: async () => mst,
+  };
+  await run(api2, "tok", "uid", T, { fetchPrices: async () => ({}) });
+  assert.deepEqual(pushed2, ["⚠️ Victor V5 MT5 mất liên lạc"]); assert.equal(db2.command.mt5Bad.code, "silent");
+  await run(api2, "tok", "uid", T + 5 * MIN, { fetchPrices: async () => ({}) });
+  assert.equal(pushed2.length, 1, "không báo lặp");
+  mst = { ...ok, ts: T + 10 * MIN - 5000 };
+  await run(api2, "tok", "uid", T + 10 * MIN, { fetchPrices: async () => ({}) });
+  assert.deepEqual(pushed2.filter((t) => t.includes("MT5")), ["⚠️ Victor V5 MT5 mất liên lạc", "✅ Victor V5 MT5 hoạt động lại"]); assert.equal(db2.command.mt5Bad, null);
+  console.log("canh MT5 OK");
+}
