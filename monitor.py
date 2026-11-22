@@ -4,6 +4,7 @@ QWS monitor — canh bot giao dịch trên máy bàn (bảng Supabase qws_live_b
   1) Mất liên lạc: status.at cũ hơn 8 phút → push cảnh báo (1 lần / sự cố); có tín hiệu lại → push "hoạt động lại".
   2) Cảnh báo giá: command.data.priceAlerts chưa bắn → lấy giá Binance → chạm ngưỡng thì push + ghi firedAt.
   3) Tổng kết ngày từ 22:00 giờ VN (lượt chạy đầu tiên trong 15:00–16:59 UTC — cron GitHub hay trễ; mỗi ngày 1 lần nhờ dailySummaryDate) từ history.trades của chế độ đang chạy.
+  1b) (22/11/2026) EA MT5: bảng qws_mt5_bot dòng 'status' — cùng luật với cf-monitor/worker.js (decideMt5), trạng thái chống báo trùng command.mt5Bad.
 Ghi dòng 'command': đọc lại bản MỚI NHẤT ngay trước khi ghi, chỉ sửa trường của monitor rồi upsert
 (không làm mất keys/config/stop/cảnh báo giá mà app vừa thêm).
 Repo PUBLIC → log Actions ai cũng xem được: chỉ in số đếm/trạng thái, KHÔNG in giá, vốn, lãi/lỗ, ghi chú.
@@ -22,6 +23,9 @@ DAILY_UTC = (15, 0)                  # 15:00 UTC = 22:00 giờ VN
 DAILY_WINDOW_MIN = 120               # gửi ở lượt chạy đầu tiên trong 15:00–16:59 UTC (cron GitHub có thể trễ hàng chục phút)
 VN = datetime.timezone(datetime.timedelta(hours=7))
 URL_LIVE, URL_MARKET = "/coin?tab=live", "/coin?tab=market"
+MT5_TABLE, URL_MT5 = "qws_mt5_bot", "/coin?tab=forex"
+MT5_SILENT_MS = 10 * 60 * 1000       # cầu nối MT5 ghi ~30 giây/lần; im > 10 phút = mất liên lạc (báo ngay)
+MT5_GRACE_MS = 10 * 60 * 1000        # lỗi khác (Algo tắt, EA không ghi…) phải kéo dài ≥ 10 phút mới báo
 UA = {"User-Agent": "qws-monitor/1.0"}
 
 SPOT_HOSTS = ["https://api.binance.com", "https://data-api.binance.vision"]  # binance.vision: không chặn IP Mỹ (runner GitHub)
@@ -144,6 +148,65 @@ def decide_offline(status, cmd, now_ms):
                 "body": f"Máy bàn đã gửi tín hiệu lại lúc {hhmm(at, now_ms)} (giờ VN){extra}. Kiểm tra lệnh đang mở trong app.",
                 "set": {"onlineAlertAt": now_ms}}
     return None
+
+
+# ---------- 1b) EA MT5 (22/11/2026) — chép luật từ cf-monitor/worker.js ----------
+def fx_closed(now_ms):
+    """Chợ Forex đóng: 05:00 thứ Bảy → 05:00 thứ Hai giờ VN."""
+    d = vn_dt(now_ms)
+    wd = d.isoweekday()  # 1 = thứ Hai … 6 = thứ Bảy, 7 = Chủ nhật
+    return (wd == 6 and d.hour >= 5) or wd == 7 or (wd == 1 and d.hour < 5)
+
+
+def mt5_problem(st, now_ms):
+    ts = to_ms((st or {}).get("ts"))
+    if not ts:
+        return None
+    if now_ms - ts > MT5_SILENT_MS:
+        return {"code": "silent", "since": ts}
+    if st.get("online") is False:
+        return {"code": "mt5off", "text": st.get("reason") or "MT5 không chạy trên máy bàn"}
+    if st.get("algo") is False:
+        return {"code": "algo", "text": "Algo Trading trong MT5 đang TẮT — EA không vào lệnh được"}
+    if st.get("eaTrade") is False:
+        return {"code": "eatrade", "text": "Tài khoản không cho EA giao dịch (quyền EA tắt)"}
+    age = num(st.get("eaAgeS"))
+    if age is None or age > MT5_SILENT_MS / 1000:
+        mins = "" if age is None else f"{round(age / 60)} phút "
+        return {"code": "ea", "text": f"EA không ghi trạng thái {mins}— EA có thể đã bị gỡ khỏi chart hoặc bị lỗi"}
+    if st.get("connected") is False and not fx_closed(now_ms):
+        return {"code": "conn", "text": "MT5 mất kết nối máy chủ sàn"}
+    return None
+
+
+def decide_mt5(st, cmd, now_ms):
+    if not st:
+        return None
+    p = mt5_problem(st, now_ms)
+    b = cmd.get("mt5Bad") if isinstance(cmd.get("mt5Bad"), dict) else None
+    ea = (st.get("ea") or {}).get("ea") or "EA"
+    if not p:
+        if not b:
+            return None
+        if b.get("alerted"):
+            ts = to_ms(st.get("ts")) or now_ms
+            return {"kind": "online", "tag": "mt5-status", "url": URL_MT5, "title": f"✅ {ea} MT5 hoạt động lại",
+                    "body": f"Cầu nối và EA báo bình thường lúc {hhmm(ts, now_ms)} (giờ VN), sau sự cố từ {hhmm(b.get('at') or now_ms, now_ms)}. Kiểm tra lệnh trong app.",
+                    "set": {"mt5Bad": None}}
+        return {"kind": "clear", "set": {"mt5Bad": None}}  # lỗi thoáng qua, chưa báo → xoá im lặng
+    state = dict(b) if b and b.get("code") == p["code"] else {"code": p["code"], "at": p.get("since") or now_ms, "alerted": None}
+    grace = 0 if p["code"] == "silent" else MT5_GRACE_MS
+    if not state.get("alerted") and now_ms - state["at"] >= grace:
+        state["alerted"] = now_ms
+        if p["code"] == "silent":
+            title = f"⚠️ {ea} MT5 mất liên lạc"
+            body = (f"Cầu nối MT5 không gửi tín hiệu từ {hhmm(p['since'], now_ms)} (giờ VN) — máy bàn tắt/mất mạng hoặc cầu nối dừng. "
+                    "Lệnh đang mở vẫn có SL/TP trên sàn.")
+        else:
+            title = f"⚠️ {ea} MT5 có vấn đề"
+            body = f"{p['text']} (từ {hhmm(state['at'], now_ms)} giờ VN). Kiểm tra MT5 trên máy bàn."
+        return {"kind": "offline", "tag": "mt5-status", "url": URL_MT5, "title": title, "body": body, "set": {"mt5Bad": state}}
+    return None if state == b else {"kind": "pending", "set": {"mt5Bad": state}}
 
 
 # ---------- 2) cảnh báo giá ----------
@@ -327,6 +390,17 @@ def read_command(token):
     return (rows[0].get("data") or {}) if rows else None
 
 
+def read_mt5_status(token):
+    """Chỉ lấy vài trường cần để canh (không kéo vị thế / nhật ký)."""
+    sel = "ts:data->ts,online:data->online,reason:data->reason,algo:data->algo,eaTrade:data->eaTrade,connected:data->connected,eaAgeS:data->eaAgeS,ea:data->ea->ea"
+    rows = http(f"{SUPABASE_URL}/rest/v1/{MT5_TABLE}?id=eq.status&select={sel}", sb(token))
+    if not rows:
+        return None
+    r = dict(rows[0])
+    r["ea"] = {"ea": r["ea"]} if r.get("ea") else None
+    return r
+
+
 def write_command(token, data):
     http(f"{SUPABASE_URL}/rest/v1/{TABLE}",
          {**sb(token), "Prefer": "resolution=merge-duplicates,return=minimal"},
@@ -404,6 +478,15 @@ def run(token, uid, now_ms, now_utc):
                 sets.update(d["set"])
     except Exception as e:
         log(f"Mất liên lạc: lỗi {short_err(e)}")
+
+    # 1b) EA MT5
+    try:
+        m = decide_mt5(read_mt5_status(token), cmd, now_ms)
+        log(f"EA MT5: {m['kind'] if m else 'bình thường'}")
+        if m and ("title" not in m or push(token, uid, m)):
+            sets.update(m["set"])
+    except Exception as e:
+        log("EA MT5: chưa có bảng qws_mt5_bot — bỏ qua." if is_missing_table(e) else f"EA MT5: lỗi {short_err(e)}")
 
     # 2) cảnh báo giá
     try:
@@ -564,8 +647,11 @@ def selftest():
           "command": {"stop": False, "config": {"mode": "testnet"},
                       "priceAlerts": [{"id": "a1", "symbol": "BTCUSDT", "op": ">=", "price": 85000, "firedAt": None}]}}
     pushed, writes, reads = [], [], {"n": 0}
+    mt5_row = None  # chưa có MT5 → phần 5) cũ không đổi
 
     def fake_http(url, headers=None, data=None, method=None, timeout=30):
+        if f"/{MT5_TABLE}?" in url:
+            return [dict(mt5_row)] if mt5_row else []
         if "select=id,data" in url:
             return [{"id": k, "data": json.loads(json.dumps(v))} for k, v in db.items()]
         if "id=eq.command" in url:
@@ -600,6 +686,53 @@ def selftest():
         assert pushed == [], pushed
         del db["command"]; pushed.clear()
         run("tok", "uid", now, now_utc)                                # thiếu dòng command → im lặng
+        assert pushed == []
+    finally:
+        g.update(saved)
+
+    # 6) EA MT5 (22/11) — 10:00 giờ VN thứ Ba 24/11
+    T = int(datetime.datetime(2026, 11, 24, 3, 0, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+    ok = {"ts": T - 20_000, "online": True, "connected": True, "algo": True, "eaTrade": True, "eaAgeS": 8, "ea": {"ea": "Victor V5"}}
+    assert mt5_problem(ok, T) is None and decide_mt5(ok, {}, T) is None and decide_mt5(None, {}, T) is None
+    s1 = decide_mt5({**ok, "ts": T - 12 * MIN}, {}, T)                                       # cầu nối im 12 phút → báo ngay
+    assert s1["title"] == "⚠️ Victor V5 MT5 mất liên lạc" and "từ 09:48 (giờ VN)" in s1["body"] and s1["url"] == "/coin?tab=forex", s1
+    assert s1["set"] == {"mt5Bad": {"code": "silent", "at": T - 12 * MIN, "alerted": T}}
+    assert decide_mt5({**ok, "ts": T - 17 * MIN}, {"mt5Bad": s1["set"]["mt5Bad"]}, T + 5 * MIN) is None   # không báo lặp
+    r1 = decide_mt5({**ok, "ts": T + 9 * MIN}, {"mt5Bad": s1["set"]["mt5Bad"]}, T + 10 * MIN)
+    assert r1["title"] == "✅ Victor V5 MT5 hoạt động lại" and r1["set"] == {"mt5Bad": None} and "sau sự cố từ 09:48" in r1["body"]
+    a1 = decide_mt5({**ok, "algo": False}, {}, T)                                             # lỗi khác: lần đầu chỉ ghi nhận
+    assert a1["kind"] == "pending" and "title" not in a1 and a1["set"]["mt5Bad"] == {"code": "algo", "at": T, "alerted": None}
+    a2 = decide_mt5({**ok, "ts": T + 10 * MIN - 20_000, "algo": False}, {"mt5Bad": a1["set"]["mt5Bad"]}, T + 10 * MIN)
+    assert a2["title"] == "⚠️ Victor V5 MT5 có vấn đề" and "Algo Trading" in a2["body"]
+    c1 = decide_mt5({**ok, "ts": T + 5 * MIN - 20_000}, {"mt5Bad": a1["set"]["mt5Bad"]}, T + 5 * MIN)
+    assert c1["kind"] == "clear" and "title" not in c1                                       # thoáng qua → xoá im lặng
+    assert mt5_problem({**ok, "online": False, "reason": "MT5 không chạy trên máy bàn"}, T)["code"] == "mt5off"
+    assert mt5_problem({**ok, "eaAgeS": 900}, T)["code"] == "ea" and mt5_problem({**ok, "eaAgeS": None}, T)["code"] == "ea"
+    assert mt5_problem({**ok, "eaTrade": False}, T)["code"] == "eatrade" and mt5_problem({**ok, "connected": False}, T)["code"] == "conn"
+    utc = lambda d, h: int(datetime.datetime(2026, 11, d, h, 0, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+    sun = utc(22, 3)
+    assert fx_closed(sun) and not fx_closed(T) and fx_closed(utc(21, 0)) and not fx_closed(utc(23, 0)) and not fx_closed(utc(20, 21))
+    assert mt5_problem({**ok, "ts": sun - 20_000, "connected": False}, sun) is None          # cuối tuần: mất kết nối sàn không báo
+    assert mt5_problem({**ok, "ts": sun - 20 * MIN}, sun)["code"] == "silent"                # nhưng cầu nối im vẫn báo
+
+    # run() trọn vòng với MT5: báo, không lặp, hoạt động lại (Worker chết → GitHub làm thay)
+    db = {"status": {"at": T - 30_000, "mode": "live"}, "history": {"trades": []}, "command": {"config": {"mode": "live"}, "priceAlerts": []}}
+    pushed.clear(); writes.clear()
+    mt5_row = {**ok, "ts": T - 15 * MIN, "ea": "Victor V5"}  # PostgREST trả ea:data->ea->ea là chuỗi
+    g["http"] = fake_http
+    g["push"] = lambda token, uid, msg: pushed.append(msg["title"]) or True
+    try:
+        run("tok", "uid", T, now_utc)
+        assert pushed == ["⚠️ Victor V5 MT5 mất liên lạc"] and db["command"]["mt5Bad"]["code"] == "silent", (pushed, db["command"])
+        db["status"]["at"] = T + 10 * MIN - 30_000
+        run("tok", "uid", T + 10 * MIN, now_utc)
+        assert pushed == ["⚠️ Victor V5 MT5 mất liên lạc"], pushed                           # không báo lặp
+        mt5_row = {**ok, "ts": T + 20 * MIN - 5000, "eaAgeS": 6, "ea": "Victor V5"}
+        db["status"]["at"] = T + 20 * MIN - 30_000
+        run("tok", "uid", T + 20 * MIN, now_utc)
+        assert pushed == ["⚠️ Victor V5 MT5 mất liên lạc", "✅ Victor V5 MT5 hoạt động lại"] and db["command"]["mt5Bad"] is None, pushed
+        mt5_row = None; pushed.clear(); db["status"]["at"] = T + 30 * MIN - 30_000
+        run("tok", "uid", T + 30 * MIN, now_utc)                                               # chưa có dòng status MT5 → im lặng
         assert pushed == []
     finally:
         g.update(saved)
